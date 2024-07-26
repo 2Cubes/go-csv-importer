@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
+	"fmt"
+	"github.com/jackc/pgconn"
 	"log"
 	"os"
 	"strings"
@@ -45,7 +47,7 @@ func mapCSVRecord(record []string) (*Product, error) {
 	} else if record[5] == "Нет" {
 		stock = 0
 	} else {
-		return nil, errors.New("invalid stock value")
+		stock = 0
 	}
 
 	priceStr := strings.Replace(record[3], ",", ".", -1)
@@ -101,9 +103,14 @@ func insertBrandsAndCategories(brandSet map[string]struct{}, categorySet map[str
 		brandMap[brand] = brandID
 	}
 
+	// Создадим временные карты для родительских и дочерних категорий
+	parentCategoryMap := make(map[string]int)
+	subcategoryMap := make(map[string]int)
+
+	// Сначала добавим все родительские категории
 	for category, parentCategory := range categorySet {
-		var categoryID int
 		if parentCategory == "" {
+			var categoryID int
 			err = tx.QueryRow(context.Background(), `
 				INSERT INTO categories (name, parent_id) VALUES ($1, NULL)
 				ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
@@ -112,16 +119,21 @@ func insertBrandsAndCategories(brandSet map[string]struct{}, categorySet map[str
 			if err != nil {
 				return nil, nil, err
 			}
-		} else {
+			parentCategoryMap[category] = categoryID
+			log.Printf("Inserted parent category: %s with ID %d", category, categoryID)
+		}
+	}
+
+	// Затем добавим все подкатегории, связывая их с родительскими категориями
+	for category, parentCategory := range categorySet {
+		if parentCategory != "" {
 			var parentCategoryID int
-			err = tx.QueryRow(context.Background(), `
-				INSERT INTO categories (name, parent_id) VALUES ($1, NULL)
-				ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-				RETURNING id
-			`, parentCategory).Scan(&parentCategoryID)
-			if err != nil {
-				return nil, nil, err
+			var ok bool
+			if parentCategoryID, ok = parentCategoryMap[parentCategory]; !ok {
+				return nil, nil, errors.New("parent category ID not found")
 			}
+
+			var categoryID int
 			err = tx.QueryRow(context.Background(), `
 				INSERT INTO categories (name, parent_id) VALUES ($1, $2)
 				ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
@@ -130,8 +142,17 @@ func insertBrandsAndCategories(brandSet map[string]struct{}, categorySet map[str
 			if err != nil {
 				return nil, nil, err
 			}
+			subcategoryMap[category] = categoryID
+			log.Printf("Inserted subcategory: %s with ID %d under parent category ID %d", category, categoryID, parentCategoryID)
 		}
-		categoryMap[category] = categoryID
+	}
+
+	// Объединим обе карты в одну
+	for k, v := range parentCategoryMap {
+		categoryMap[k] = v
+	}
+	for k, v := range subcategoryMap {
+		categoryMap[k] = v
 	}
 
 	err = tx.Commit(context.Background())
@@ -145,29 +166,50 @@ func insertBrandsAndCategories(brandSet map[string]struct{}, categorySet map[str
 func processBatch(batch []*Product, dbpool *pgxpool.Pool, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	tx, err := dbpool.Begin(context.Background())
-	if err != nil {
-		log.Printf("Unable to begin transaction: %v", err)
-		return
-	}
-	defer tx.Rollback(context.Background())
+	const maxRetries = 5
+	var attempt int
 
-	batchQueries := &pgx.Batch{}
-	for _, product := range batch {
-		batchQueries.Queue("INSERT INTO products (sku, name, description, price, stock, brand_id, category_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, price = EXCLUDED.price, stock = EXCLUDED.stock, brand_id = EXCLUDED.brand_id, category_id = EXCLUDED.category_id",
-			product.SKU, product.Name, product.Description, product.Price, product.Stock, product.BrandID, product.CategoryID)
+	for attempt = 0; attempt < maxRetries; attempt++ {
+		tx, err := dbpool.Begin(context.Background())
+		if err != nil {
+			log.Printf("Unable to begin transaction: %v", err)
+			return
+		}
+		defer tx.Rollback(context.Background())
+
+		for _, product := range batch {
+			query := `
+				INSERT INTO products (sku, name, description, price, stock, brand_id, category_id) 
+				VALUES ($1, $2, $3, $4, $5, $6, $7) 
+				ON CONFLICT (sku) 
+				DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, price = EXCLUDED.price, stock = EXCLUDED.stock, brand_id = EXCLUDED.brand_id, category_id = EXCLUDED.category_id
+			`
+			sqlStatement := fmt.Sprintf(query, product.SKU, product.Name, product.Description, product.Price, product.Stock, product.BrandID, product.CategoryID)
+
+			_, err := tx.Exec(context.Background(), query,
+				product.SKU, product.Name, product.Description, product.Price, product.Stock, product.BrandID, product.CategoryID)
+			if err != nil {
+				log.Printf("Error executing query: %s, Error: %v", sqlStatement, err)
+				return
+			}
+		}
+
+		err = tx.Commit(context.Background())
+		if err != nil {
+			if pgxErr, ok := err.(*pgconn.PgError); ok && pgxErr.Code == "40P01" {
+				log.Printf("Deadlock detected, attempt %d/%d", attempt+1, maxRetries)
+				time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
+				continue
+			}
+			log.Printf("Unable to commit transaction: %v", err)
+			return
+		}
+
+		break
 	}
 
-	br := tx.SendBatch(context.Background(), batchQueries)
-	if _, err := br.Exec(); err != nil {
-		log.Printf("Error executing batch: %v", err)
-		return
-	}
-	br.Close()
-
-	err = tx.Commit(context.Background())
-	if err != nil {
-		log.Printf("Unable to commit transaction: %v", err)
+	if attempt == maxRetries {
+		log.Printf("Max retries reached, unable to process batch")
 	}
 }
 
@@ -247,13 +289,15 @@ func main() {
 			}
 
 			brandSet[product.Brand] = struct{}{}
+			if product.Category == "Legrand" {
+				log.Printf("Legrand %v", product)
+			}
 			categorySet[product.Category] = ""
 
 			if product.Subcategory != "" {
 				log.Printf("Subcategory: %s", product.Subcategory)
 				categorySet[product.Subcategory] = product.Category
 			}
-
 			records = append(records, product)
 		}
 
