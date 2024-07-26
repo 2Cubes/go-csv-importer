@@ -1,0 +1,11 @@
+.env
+app.log
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.DS_Store
+pkg/
+bin/
+vendor/
